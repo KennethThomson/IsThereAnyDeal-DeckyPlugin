@@ -41,9 +41,21 @@ export function patchStore(serverApi: ServerAPI): () => void {
     // This helps prevent race conditions where a WS message arrives after we left.
     let isStoreMounted = false;
 
+    // Pending 1s delay between entering the store and connecting
+    let enterTimer: NodeJS.Timeout | null = null;
+
+    // Bumped on every store exit, so a connect attempt still awaiting fetch from a previous visit knows to stop
+    let visitEpoch = 0;
+
     // Disconnect/teardown helper
     const disconnectStoreDebugger = () => {
         isStoreMounted = false; // Mark as inactive immediately
+        visitEpoch++;
+
+        if (enterTimer) {
+            clearTimeout(enterTimer);
+            enterTimer = null;
+        }
 
         if (storeWebSocket) {
             // Remove listeners to prevent any pending messages from firing
@@ -82,7 +94,7 @@ export function patchStore(serverApi: ServerAPI): () => void {
         CACHE.setValue(CACHE.APP_ID_KEY, appId ?? "");
     };
 
-    const connectToStoreDebugger = async (retries = 3) => {
+    const connectToStoreDebugger = async (epoch: number, retries = 3) => {
         // Stop if we navigated away during the async wait
         if (!isStoreMounted) {
             CACHE.setValue(CACHE.APP_ID_KEY, "");
@@ -92,9 +104,15 @@ export function patchStore(serverApi: ServerAPI): () => void {
         try {
             // 1. Fetch the tabs
             const response = await serverApi.fetchNoCors<{ body: string }>('http://localhost:8080/json');
+
+            // Stop if the user left the store (or left and came back) while we were waiting
+            if (!isStoreMounted || epoch !== visitEpoch) {
+                return;
+            }
+
             if (!response.success) {
                 if (retries > 0 && isStoreMounted) {
-                    retryTimer = setTimeout(() => connectToStoreDebugger(retries - 1), 1000);
+                    retryTimer = setTimeout(() => connectToStoreDebugger(epoch, retries - 1), 1000);
                     return;
                 }
                 CACHE.setValue(CACHE.APP_ID_KEY, "");
@@ -107,7 +125,7 @@ export function patchStore(serverApi: ServerAPI): () => void {
             // Early return if no store tab / websocket
             if (!storeTab || !storeTab.webSocketDebuggerUrl) {
                 if (retries > 0 && isStoreMounted) {
-                    retryTimer = setTimeout(() => connectToStoreDebugger(retries - 1), 1000);
+                    retryTimer = setTimeout(() => connectToStoreDebugger(epoch, retries - 1), 1000);
                     return;
                 }
                 CACHE.setValue(CACHE.APP_ID_KEY, "");
@@ -156,8 +174,12 @@ export function patchStore(serverApi: ServerAPI): () => void {
             }
 
         } catch (e) {
+            // A failed attempt from a previous visit must not retry or touch the cache
+            if (epoch !== visitEpoch) {
+                return;
+            }
             if (retries > 0 && isStoreMounted) {
-                retryTimer = setTimeout(() => connectToStoreDebugger(retries - 1), 1000);
+                retryTimer = setTimeout(() => connectToStoreDebugger(epoch, retries - 1), 1000);
                 return;
             }
             CACHE.setValue(CACHE.APP_ID_KEY, "");
@@ -170,16 +192,17 @@ export function patchStore(serverApi: ServerAPI): () => void {
         if (pathname === '/steamweb') {
             // Set a small timeout to make sure the store tab url is updated after the navigation,
             // e.g. when going from the library to the store, a game's store page might still be loaded but then steamOS immediately navigates to the front page causing some weird timing issues.
-            setTimeout(() => {
-                if (!isStoreMounted) {
+            if (!isStoreMounted && !enterTimer) {
+                enterTimer = setTimeout(() => {
+                    enterTimer = null;
                     isStoreMounted = true;
-                    connectToStoreDebugger();
-                }
-            },1000)
-
+                    connectToStoreDebugger(visitEpoch);
+                }, 1000);
+            }
         }
         else {
-            if (isStoreMounted) {
+            // Also cancel a pending entry timer, otherwise leaving within 1s would still connect after we left
+            if (isStoreMounted || enterTimer) {
                 disconnectStoreDebugger();
             }
         }
